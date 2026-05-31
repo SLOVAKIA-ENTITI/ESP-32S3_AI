@@ -1,0 +1,1304 @@
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include <WiFi.h>
+#include <NTPClient.h>
+#include <WiFiUDP.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <math.h>
+
+#include "DHT.h"
+// ═══════════════════════════════════════════════════════════════════
+//  USER CONFIG
+// ═══════════════════════════════════════════════════════════════════
+#define WIFI_SSID       "wifi_net-cool"
+#define WIFI_PASS       "povina401"
+
+#define UTC_OFFSET_SEC  7200
+#define NTP_SERVER      "pool.ntp.org"
+
+
+char weatherLat[12] = "49.30";
+char weatherLon[12] = "18.78";
+
+// ═══════════════════════════════════════════════════════════════════
+//  PIN DEFINITIONS
+// ═══════════════════════════════════════════════════════════════════
+#define TFT_CS    5
+#define TFT_DC    2
+#define TFT_RST   4
+#define TFT_BL    13
+#define BUZZER    12
+#define BTN_STOP  32   // button stops alarm (active LOW, use INPUT_PULLUP)
+#define LED_BUZZ  33   // LED simulates buzzer pattern
+#define DHTPIN 22
+#define DHTTYPE DHT22
+DHT dht(DHTPIN, DHTTYPE);
+// ═══════════════════════════════════════════════════════════════════
+//  COLOR PALETTE
+// ═══════════════════════════════════════════════════════════════════
+#define C_BG        tft.color565(10,  10,  18)
+#define C_TOPBAR    tft.color565(13,  13,  26)
+#define C_BTMBAR    tft.color565( 8,   8,  15)
+#define C_TILE      tft.color565(13,  13,  32)
+#define C_RULE      tft.color565(15,  16,  50)
+#define C_CLOCKBIG  tft.color565(232, 238, 255)
+#define C_SEC       tft.color565( 68,  85, 170)
+#define C_DIM       tft.color565( 85, 102, 170)
+#define C_ACCENT    tft.color565(255, 170,   0)
+#define C_LIVE      tft.color565(  0, 204, 102)
+#define C_TEMP      tft.color565(255, 187,   0)
+#define C_HUMID     tft.color565( 68, 170, 255)
+#define C_WIND      tft.color565(136, 221, 204)
+#define C_RED       tft.color565(220,  50,  50)
+#define C_FC0       tft.color565(255, 200,  80)
+#define C_FC1       tft.color565( 80, 200, 255)
+#define C_FC2       tft.color565(140, 255, 180)
+
+// ═══════════════════════════════════════════════════════════════════
+//  ALARM STRUCT
+// ═══════════════════════════════════════════════════════════════════
+#define MAX_ALARMS 5
+
+struct Alarm {
+  int  hour;
+  int  minute;
+  bool enabled;
+  bool days[7];
+};
+
+// ═══════════════════════════════════════════════════════════════════
+//  GLOBALS
+// ═══════════════════════════════════════════════════════════════════
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
+WebServer        server(80);
+Preferences      prefs;
+
+WiFiUDP   ntpUDP;
+NTPClient ntpClient(ntpUDP, NTP_SERVER, UTC_OFFSET_SEC, 60000);
+
+int  prevH = -1, prevM = -1, prevS = -1, prevDay = -1;
+
+Alarm alarms[MAX_ALARMS];
+bool  alarmRinging = false;
+int   ringAlarmIdx = -1;
+unsigned long alarmStart = 0;
+#define ALARM_DURATION_MS  60000UL
+
+bool ntpSynced = false;
+
+float  wTemp  = 0;
+int    wHumid = 0;
+int    wWind  = 0;
+float  fc[3]  = {0, 0, 0};
+String wDesc  = "---";
+unsigned long lastWeatherMs = 0;
+#define WEATHER_INTERVAL_MS  900000UL
+
+char prevClockStr[6] = "     ";
+char prevSecStr[4]   = "   ";
+int  prevBarFill     = -1;
+int  prevMinLeft     = -2;   // -2 = never drawn, -1 = no alarm
+int prevBtmBar = -1;
+// ═══════════════════════════════════════════════════════════════════
+//  FORWARD DECLARATIONS
+// ═══════════════════════════════════════════════════════════════════
+void drawSplash();
+void drawStaticLayout();
+void drawTopBar(int h, int m, int wd, int day, int mo, int yr);
+void drawClock(int h, int m, int s);
+void drawClockDigit(int x, int y, char c, uint8_t sz, uint16_t col, uint16_t bg);
+void drawWeather();
+void drawBottomBar(int h, int m, int s);
+void drawBottomBarAlarm(int h, int m, int s, bool forceRedraw);
+void fetchWeather();
+void checkAlarms(int h, int m, int s, int wd);
+void stopAlarm();
+void saveAlarms();
+void loadAlarms();
+void setupWebServer();
+void decodeDate(unsigned long epoch, int &yr, int &mo, int &day);
+const char* weekdayStr(int wd);
+const char* weekdayShort(int wd);
+const char* monthStr(int mo);
+void drawSunIcon(int cx, int cy, uint16_t col);
+void drawCloudIcon(int cx, int cy, uint16_t col);
+void drawRainIcon(int cx, int cy, uint16_t col);
+void drawSnowIcon(int cx, int cy, uint16_t col);
+void drawIndoor();
+void handleSaveLoc();
+void forceClockRedraw() {
+
+  for (int i = 0; i < 5; i++) {
+    prevClockStr[i] = ' ';
+  }
+
+  for (int i = 0; i < 3; i++) {
+    prevSecStr[i] = ' ';
+  }
+}
+
+  float currentTemp = 0;
+  float currentHum = 0;
+
+unsigned long lastClimateRead = 0;
+
+unsigned long lastDHTms = 0;
+#define DHT_INTERVAL_MS 2000UL
+
+// flicker-free indoor cache
+char prevIndoorTemp[8]  = "       ";
+char prevIndoorHumid[8] = "       ";
+
+// ═══════════════════════════════════════════════════════════════════
+//  ALARM PERSISTENCE
+// ═══════════════════════════════════════════════════════════════════
+void saveAlarms() {
+  prefs.begin("alarms", false);
+  for (int i = 0; i < MAX_ALARMS; i++) {
+    char key[16];
+    snprintf(key, sizeof(key), "ah%d", i); prefs.putInt(key,  alarms[i].hour);
+    snprintf(key, sizeof(key), "am%d", i); prefs.putInt(key,  alarms[i].minute);
+    snprintf(key, sizeof(key), "ae%d", i); prefs.putBool(key, alarms[i].enabled);
+    for (int d = 0; d < 7; d++) {
+      snprintf(key, sizeof(key), "ad%d%d", i, d);
+      prefs.putBool(key, alarms[i].days[d]);
+    }
+  }
+  // save location too
+  prefs.putString("lat", weatherLat);
+  prefs.putString("lon", weatherLon);
+  prefs.end();
+}
+void handleSaveLoc() {
+  if (!server.hasArg("plain")) { server.send(400, "text/plain", "No body"); return; }
+
+  DynamicJsonDocument doc(256);
+  DeserializationError err = deserializeJson(doc, server.arg("plain"));
+  if (err) { server.send(400, "text/plain", "Bad JSON"); return; }
+
+  String lat = doc["lat"].as<String>();
+  String lon = doc["lon"].as<String>();
+
+  float latF = lat.toFloat();
+  float lonF = lon.toFloat();
+  if (latF < -90 || latF > 90 || lonF < -180 || lonF > 180) {
+    server.send(400, "text/plain", "Invalid coordinates");
+    return;
+  }
+
+  strncpy(weatherLat, lat.c_str(), sizeof(weatherLat) - 1);
+  strncpy(weatherLon, lon.c_str(), sizeof(weatherLon) - 1);
+  saveAlarms();
+
+  // ── force full weather redraw by resetting cached values ─────────
+  wTemp  = -999;
+  wHumid = -999;
+  wWind  = -999;
+  wDesc  = "";
+  for (int i = 0; i < 3; i++) fc[i] = -999;
+
+  // ── respond to browser first, then fetch ─────────────────────────
+  server.send(200, "text/plain", "OK");
+  Serial.printf("LOCATION updated: %s, %s — fetching weather...\n", weatherLat, weatherLon);
+
+  // ── now fetch with new coordinates ───────────────────────────────
+  fetchWeather();
+}
+
+void loadAlarms() {
+  for (int i = 0; i < MAX_ALARMS; i++) {
+    alarms[i].hour    = 7;
+    alarms[i].minute  = 0;
+    alarms[i].enabled = false;
+    for (int d = 0; d < 7; d++) alarms[i].days[d] = true;
+  }
+  prefs.begin("alarms", true);
+  for (int i = 0; i < MAX_ALARMS; i++) {
+    char key[16];
+    snprintf(key, sizeof(key), "ah%d", i); alarms[i].hour    = prefs.getInt(key,  7);
+    snprintf(key, sizeof(key), "am%d", i); alarms[i].minute  = prefs.getInt(key,  0);
+    snprintf(key, sizeof(key), "ae%d", i); alarms[i].enabled = prefs.getBool(key, false);
+    for (int d = 0; d < 7; d++) {
+      snprintf(key, sizeof(key), "ad%d%d", i, d);
+      alarms[i].days[d] = prefs.getBool(key, true);
+    }
+  }
+  // load location
+  String lat = prefs.getString("lat", "49.30");
+  String lon = prefs.getString("lon", "18.78");
+  strncpy(weatherLat, lat.c_str(), sizeof(weatherLat) - 1);
+  strncpy(weatherLon, lon.c_str(), sizeof(weatherLon) - 1);
+  prefs.end();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  WEB SERVER HANDLERS
+// ═══════════════════════════════════════════════════════════════════
+void handleClimate() {
+
+  String json = "{";
+  json += "\"temp\":" + String(currentTemp, 1) + ",";
+  json += "\"hum\":" + String(currentHum, 1);
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
+void handleRoot() {
+
+  int h = ntpClient.getHours();
+  int m = ntpClient.getMinutes();
+
+  char tbuf[6];
+  snprintf(tbuf, sizeof(tbuf), "%02d:%02d", h, m);
+
+  // build alarm JSON
+  String alarmJson = "[";
+
+  for (int i = 0; i < MAX_ALARMS; i++) {
+
+    alarmJson += "{";
+    alarmJson += "\"hour\":" + String(alarms[i].hour) + ",";
+    alarmJson += "\"minute\":" + String(alarms[i].minute) + ",";
+    alarmJson += "\"enabled\":" + String(alarms[i].enabled ? "true" : "false") + ",";
+    alarmJson += "\"days\":[";
+
+    for (int d = 0; d < 7; d++) {
+      alarmJson += alarms[i].days[d] ? "true" : "false";
+      if (d < 6) alarmJson += ",";
+    }
+
+    alarmJson += "]}";
+
+    if (i < MAX_ALARMS - 1) alarmJson += ",";
+  }
+
+  alarmJson += "]";
+
+  String html = F(
+    "<!DOCTYPE html><html lang='en'><head>"
+    "<meta charset='UTF-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>Alarm Clock</title>"
+    "<style>"
+    "*{box-sizing:border-box;margin:0;padding:0}"
+    "body{"
+      "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
+      "background:#0a0a12;color:#e8eeff;min-height:100vh;padding:20px 16px"
+    "}"
+    "h1{"
+      "text-align:center;font-size:1.2rem;font-weight:400;color:#aab;"
+      "letter-spacing:3px;text-transform:uppercase;margin-bottom:4px"
+    "}"
+    ".clock{"
+      "text-align:center;font-size:3.2rem;font-weight:300;"
+      "color:#e8eeff;letter-spacing:6px;margin-bottom:4px"
+    "}"
+    ".ip{"
+      "text-align:center;font-size:0.72rem;color:#334477;"
+      "letter-spacing:1px;margin-bottom:18px"
+    "}"
+    ".weather{"
+      "background:#0d0d20;border:1px solid #1e2255;border-radius:12px;"
+      "padding:18px;margin-bottom:16px;display:flex;"
+      "justify-content:space-around;align-items:center;"
+      "box-shadow:0 0 20px rgba(255,170,0,.08)"
+    "}"
+    ".climate-box{flex:1;text-align:center}"
+    ".divider{width:1px;height:60px;background:#1e2255}"
+    ".wlabel{"
+      "font-size:.7rem;color:#5566aa;letter-spacing:2px;"
+      "text-transform:uppercase;margin-bottom:8px"
+    "}"
+    ".wtemp{"
+      "font-size:2rem;font-weight:300;color:#ffaa00;letter-spacing:2px"
+    "}"
+    ".card{"
+      "background:#0d0d20;border:1px solid #1e2255;"
+      "border-radius:12px;padding:16px;margin-bottom:12px"
+    "}"
+    ".card-top{"
+      "display:flex;justify-content:space-between;"
+      "align-items:center;margin-bottom:14px"
+    "}"
+    ".alabel{"
+      "font-size:0.7rem;color:#5566aa;letter-spacing:2px;"
+      "text-transform:uppercase;margin-bottom:2px"
+    "}"
+    ".atime{font-size:1.5rem;color:#e8eeff;letter-spacing:2px}"
+    ".toggle{position:relative;width:46px;height:26px;flex-shrink:0}"
+    ".toggle input{opacity:0;width:0;height:0}"
+    ".sl{"
+      "position:absolute;inset:0;background:#1e2255;"
+      "border-radius:26px;transition:.3s;cursor:pointer"
+    "}"
+    ".sl:before{"
+      "content:'';position:absolute;width:18px;height:18px;"
+      "left:4px;top:4px;background:#5566aa;border-radius:50%;transition:.3s"
+    "}"
+    "input:checked+.sl{background:#ffaa00}"
+    "input:checked+.sl:before{transform:translateX(20px);background:#fff}"
+    ".row{display:flex;gap:8px;margin-bottom:10px;align-items:center}"
+    ".rlabel{"
+      "font-size:0.7rem;color:#5566aa;width:52px;"
+      "text-transform:uppercase;letter-spacing:1px;flex-shrink:0"
+    "}"
+    "input[type=time],input[type=text]{"
+      "background:#0a0a18;color:#e8eeff;border:1px solid #1e2255;"
+      "border-radius:8px;padding:8px 10px;font-size:1rem;"
+      "outline:none;letter-spacing:2px"
+    "}"
+    "input[type=time]{width:130px}"
+    "input[type=text]{width:130px;letter-spacing:1px}"
+    ".days{display:flex;gap:5px;flex-wrap:wrap}"
+    ".day{"
+      "width:36px;height:36px;border-radius:50%;border:1px solid #1e2255;"
+      "background:#0a0a18;color:#5566aa;font-size:0.65rem;cursor:pointer;"
+      "display:flex;align-items:center;justify-content:center;"
+      "text-transform:uppercase;letter-spacing:1px;transition:.15s;user-select:none"
+    "}"
+    ".day.on{background:#ffaa00;border-color:#ffaa00;color:#0a0a12;font-weight:700}"
+    ".del{"
+      "padding:8px 12px;background:transparent;color:#cc3333;"
+      "border:1px solid #331111;border-radius:8px;font-size:0.8rem;"
+      "cursor:pointer;letter-spacing:1px;white-space:nowrap"
+    "}"
+    ".del:hover{background:#1a0000}"
+    ".add-btn{"
+      "width:100%;padding:12px;background:transparent;color:#5566aa;"
+      "border:1px solid #1e2255;border-radius:8px;font-size:0.9rem;"
+      "cursor:pointer;letter-spacing:2px;text-transform:uppercase;margin-bottom:12px"
+    "}"
+    ".add-btn:hover{border-color:#5566aa;color:#e8eeff}"
+    ".save-btn{"
+      "width:100%;padding:13px;background:#ffaa00;color:#0a0a12;"
+      "border:none;border-radius:8px;font-size:1rem;font-weight:700;"
+      "cursor:pointer;letter-spacing:2px;text-transform:uppercase"
+    "}"
+    ".save-btn.blue{background:#3355aa;color:#e8eeff;margin-top:10px}"
+    ".save-btn.blue:hover{background:#4466cc}"
+    ".hint{"
+      "font-size:0.7rem;color:#334477;letter-spacing:1px;"
+      "margin:6px 0 10px 0;line-height:1.5"
+    "}"
+    ".coord-row{display:flex;gap:10px;margin-bottom:10px}"
+    ".coord-row>div{flex:1}"
+    ".coord-row .rlabel{display:block;margin-bottom:4px}"
+    ".coord-row input{width:100%}"
+    ".empty{"
+      "text-align:center;color:#334477;padding:24px;"
+      "font-size:0.85rem;letter-spacing:1px"
+    "}"
+    ".toast{"
+      "position:fixed;bottom:24px;left:50%;transform:translateX(-50%);"
+      "background:#00cc66;color:#0a0a12;padding:10px 28px;border-radius:8px;"
+      "font-weight:700;opacity:0;transition:opacity .3s;pointer-events:none;z-index:999"
+    "}"
+    ".section-title{"
+      "font-size:0.7rem;color:#5566aa;letter-spacing:3px;"
+      "text-transform:uppercase;margin:20px 0 10px 0"
+    "}"
+    "</style></head><body>"
+
+    "<h1>Alarm Clock</h1>"
+    "<div class='clock' id='clk'>"
+  );
+
+  html += tbuf;
+
+  html += F("</div><div class='ip'>");
+  html += WiFi.localIP().toString();
+
+  html += F(
+    "</div>"
+
+    // ── indoor climate card ──
+    "<div class='weather'>"
+      "<div class='climate-box'>"
+        "<div class='wlabel'>Indoor Temp</div>"
+        "<div class='wtemp'><span id='temp'>--.-</span>°C</div>"
+      "</div>"
+      "<div class='divider'></div>"
+      "<div class='climate-box'>"
+        "<div class='wlabel'>Indoor Humid</div>"
+        "<div class='wtemp'><span id='hum'>--.-</span>%</div>"
+      "</div>"
+    "</div>"
+
+    // ── alarms section ──
+    "<div class='section-title'>Alarms</div>"
+    "<div id='cont'></div>"
+    "<button class='add-btn' onclick='addAlarm()'>+ Add Alarm</button>"
+    "<button class='save-btn' onclick='saveAll()'>Save Alarms</button>"
+
+    "<div class='toast' id='toast'>Saved!</div>"
+  );
+
+  // ── location card ──
+  html += F("<div class='section-title'>Weather Location</div>");
+  html += F(
+    "<div class='card'>"
+      "<div class='alabel' style='margin-bottom:12px'>Coordinates</div>"
+      "<div class='coord-row'>"
+        "<div>"
+          "<span class='rlabel'>Latitude</span>"
+          "<input type='text' id='lat' maxlength='10' placeholder='49.30'>"
+        "</div>"
+        "<div>"
+          "<span class='rlabel'>Longitude</span>"
+          "<input type='text' id='lon' maxlength='10' placeholder='18.78'>"
+        "</div>"
+      "</div>"
+      "<div class='hint'>"
+        "Decimal degrees only — e.g. 48.1486 / 17.1077 for Bratislava.<br>"
+        "Find yours at maps.google.com (right-click any point)."
+      "</div>"
+      "<button class='save-btn blue' onclick='saveLoc()'>"
+        "Save Location &amp; Refresh Weather"
+      "</button>"
+    "</div>"
+  );
+
+  // ── scripts ──
+  html += F("<script>const DN=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];const MAX=");
+  html += String(MAX_ALARMS);
+  html += F(";let A=");
+  html += alarmJson;
+
+  // inject current coords
+  html += F(";document.getElementById('lat').value='");
+  html += weatherLat;
+  html += F("';document.getElementById('lon').value='");
+  html += weatherLon;
+  html += F("';");
+
+  html += F(
+    "function pad(n){return String(n).padStart(2,'0')}"
+
+    // climate fetch
+    "function loadClimate(){"
+      "fetch('/climate').then(r=>r.json()).then(d=>{"
+        "document.getElementById('temp').textContent=d.temp.toFixed(1);"
+        "document.getElementById('hum').textContent=d.hum.toFixed(1);"
+      "});"
+    "}"
+
+    // render alarms
+    "function render(){"
+      "const c=document.getElementById('cont');"
+      "c.innerHTML='';"
+      "const active=A.map((a,i)=>({a,i})).filter(x=>x.a.enabled);"
+      "if(active.length===0){"
+        "c.innerHTML=\"<div class='empty'>No alarms set</div>\";"
+        "return;"
+      "}"
+      "active.forEach(({a,i})=>{"
+        "const d=document.createElement('div');"
+        "d.className='card';"
+        "const dH=DN.map((n,di)=>"
+          "`<div class='day ${a.days[di]?\"on\":\"\"}' onclick='tDay(${i},${di})'>${n}</div>`"
+        ").join('');"
+        "d.innerHTML=`"
+          "<div class='card-top'>"
+            "<div>"
+              "<div class='alabel'>Alarm ${active.indexOf(active.find(x=>x.i===i))+1}</div>"
+              "<div class='atime'>${pad(a.hour)}:${pad(a.minute)}</div>"
+            "</div>"
+            "<label class='toggle'>"
+              "<input type='checkbox' checked onchange='tEnable(${i},this)'>"
+              "<span class='sl'></span>"
+            "</label>"
+          "</div>"
+          "<div class='row'>"
+            "<span class='rlabel'>Time</span>"
+            "<input type='time' value='${pad(a.hour)}:${pad(a.minute)}' onchange='setT(${i},this.value)'>"
+            "<button class='del' onclick='delAlarm(${i})'>Delete</button>"
+          "</div>"
+          "<div class='row'>"
+            "<span class='rlabel'>Days</span>"
+            "<div class='days'>${dH}</div>"
+          "</div>`;"
+        "c.appendChild(d);"
+      "});"
+    "}"
+
+    "function tEnable(i,el){if(!el.checked){A[i].enabled=false;}render();}"
+    "function tDay(i,d){A[i].days[d]=!A[i].days[d];render();}"
+    "function setT(i,v){"
+      "const[h,m]=v.split(':').map(Number);"
+      "A[i].hour=h;A[i].minute=m;render();"
+    "}"
+    "function delAlarm(i){"
+      "A[i].enabled=false;A[i].hour=7;A[i].minute=0;"
+      "for(let d=0;d<7;d++)A[i].days[d]=true;"
+      "render();"
+    "}"
+    "function addAlarm(){"
+      "const slot=A.findIndex(a=>!a.enabled);"
+      "if(slot<0){alert('Maximum '+MAX+' alarms reached');return;}"
+      "A[slot].enabled=true;A[slot].hour=7;A[slot].minute=0;"
+      "for(let d=0;d<7;d++)A[slot].days[d]=true;"
+      "render();"
+    "}"
+    "function saveAll(){"
+      "fetch('/save',{"
+        "method:'POST',"
+        "headers:{'Content-Type':'application/json'},"
+        "body:JSON.stringify(A)"
+      "}).then(r=>r.text()).then(()=>{"
+        "showToast('Alarms saved!');"
+      "}).catch(()=>alert('Save failed'));"
+    "}"
+    "function saveLoc(){"
+      "const lat=document.getElementById('lat').value.trim();"
+      "const lon=document.getElementById('lon').value.trim();"
+      "if(!lat||!lon){alert('Enter both coordinates');return;}"
+      "const lf=parseFloat(lat),lo=parseFloat(lon);"
+      "if(isNaN(lf)||isNaN(lo)||lf<-90||lf>90||lo<-180||lo>180){"
+        "alert('Invalid coordinates');return;"
+      "}"
+      "fetch('/saveloc',{"
+        "method:'POST',"
+        "headers:{'Content-Type':'application/json'},"
+        "body:JSON.stringify({lat,lon})"
+      "}).then(r=>r.text()).then(t=>{"
+        "if(t==='OK')showToast('Location saved! Weather refreshing...');"
+        "else alert('Error: '+t);"
+      "}).catch(()=>alert('Save failed'));"
+    "}"
+    "function showToast(msg){"
+      "const t=document.getElementById('toast');"
+      "t.textContent=msg;t.style.opacity=1;"
+      "setTimeout(()=>{t.style.opacity=0;t.textContent='Saved!';},2500);"
+    "}"
+
+    // live clock
+    "setInterval(()=>{"
+      "fetch('/time').then(r=>r.text()).then(t=>{"
+        "document.getElementById('clk').textContent=t;"
+      "});"
+    "},5000);"
+
+    // climate refresh
+    "loadClimate();"
+    "setInterval(loadClimate,60000);"
+
+    "render();"
+    "</script></body></html>"
+  );
+
+  server.send(200, "text/html", html);
+}
+
+void handleTime() {
+  char buf[6];
+  snprintf(buf, sizeof(buf), "%02d:%02d",
+           ntpClient.getHours(), ntpClient.getMinutes());
+  server.send(200, "text/plain", buf);
+}
+
+void handleSave() {
+  if (!server.hasArg("plain")) {
+    server.send(400, "text/plain", "No body");
+    return;
+  }
+
+  DynamicJsonDocument doc(2048);
+  DeserializationError err = deserializeJson(doc, server.arg("plain"));
+  if (err) {
+    server.send(400, "text/plain", "Bad JSON");
+    return;
+  }
+
+  for (int i = 0; i < MAX_ALARMS && i < (int)doc.size(); i++) {
+    alarms[i].hour    = doc[i]["hour"].as<int>();
+    alarms[i].minute  = doc[i]["minute"].as<int>();
+    alarms[i].enabled = doc[i]["enabled"].as<bool>();
+    for (int d = 0; d < 7; d++)
+      alarms[i].days[d] = doc[i]["days"][d].as<bool>();
+  }
+
+  saveAlarms();
+
+  // force full bottom bar redraw on next tick
+  prevMinLeft = -2;
+
+  server.send(200, "text/plain", "OK");
+  Serial.println("WEB: alarms saved");
+}
+
+void setupWebServer() {
+  server.on("/",     HTTP_GET,  handleRoot);
+  server.on("/time", HTTP_GET,  handleTime);
+  server.on("/save", HTTP_POST, handleSave);
+   server.on("/saveloc", HTTP_POST, handleSaveLoc);
+  server.begin();
+  Serial.print("Web server: http://");
+  Serial.println(WiFi.localIP());
+  
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SETUP
+// ═══════════════════════════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+  dht.begin();
+  pinMode(TFT_BL, OUTPUT); digitalWrite(TFT_BL, HIGH);
+  pinMode(BUZZER,  OUTPUT); digitalWrite(BUZZER, LOW);
+pinMode(BTN_STOP, INPUT_PULLUP);
+  pinMode(LED_BUZZ, OUTPUT);
+  digitalWrite(LED_BUZZ, LOW);
+  tft.begin();
+  tft.setRotation(1);
+  tft.fillScreen(C_BG);
+
+  loadAlarms();
+  drawSplash();
+server.on("/climate", HTTP_GET, handleClimate);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries < 24) {
+    delay(500); tries++;
+    tft.setTextColor(C_DIM);
+    tft.setTextSize(1);
+    tft.setCursor(148 + tries * 6, 136);
+    tft.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    ntpClient.begin();
+    ntpClient.update();
+    ntpSynced = true;
+    setupWebServer();
+
+    tft.setTextColor(C_LIVE);
+    tft.setTextSize(1);
+    tft.setCursor(80, 150);
+    tft.print(WiFi.localIP().toString());
+    delay(2000);
+    
+  }
+
+  tft.fillScreen(C_BG);
+  drawStaticLayout();
+  if (ntpSynced) fetchWeather();
+  
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  LOOP
+// ═══════════════════════════════════════════════════════════════════
+void loop() {
+  server.handleClient();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    ntpSynced = false;
+    WiFi.reconnect();
+    unsigned long t = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t < 10000) delay(500);
+    if (WiFi.status() == WL_CONNECTED) {
+      ntpClient.update();
+      ntpSynced = true;
+    }
+  }
+
+  ntpClient.update();
+
+if (millis() - lastDHTms > DHT_INTERVAL_MS) {
+    float t = dht.readTemperature();
+    float h2 = dht.readHumidity();
+    if (!isnan(t) && !isnan(h2)) {
+      currentTemp  = t;
+      currentHum = h2;
+      drawIndoor();   // only redraws if values changed
+    }
+    lastDHTms = millis();
+  }
+
+  int h  = ntpClient.getHours();
+  int m  = ntpClient.getMinutes();
+  int s  = ntpClient.getSeconds();
+  int wd = ntpClient.getDay();
+
+  int yr, mo, day;
+  decodeDate(ntpClient.getEpochTime(), yr, mo, day);
+
+  if (millis() - lastWeatherMs > WEATHER_INTERVAL_MS) fetchWeather();
+
+  if (h != prevH || m != prevM || day != prevDay) {
+    drawTopBar(h, m, wd, day, mo, yr);
+    prevDay = day;
+  }
+
+  if (h != prevH || m != prevM || s != prevS) {
+    drawClock(h, m, s);
+    drawBottomBar(h, m, s);
+    prevH = h; prevM = m; prevS = s;
+  }
+
+  checkAlarms(h, m, s, wd);
+  delay(200);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ALARM CHECK
+// ═══════════════════════════════════════════════════════════════════
+
+// buzzer/LED pattern: three short bursts then a long one, repeating
+// pattern in ms: ON 80 | OFF 60 | ON 80 | OFF 60 | ON 80 | OFF 200 | ON 400 | OFF 300
+// total cycle = 1260ms
+#define PAT_LEN 8
+const uint16_t PAT_MS[PAT_LEN]  = { 80, 60, 80, 60, 80, 200, 400, 300 };
+const bool     PAT_ON[PAT_LEN]  = {  1,  0,  1,  0,  1,   0,   1,   0 };
+
+void updateBuzzPattern() {
+  // where are we inside the current cycle?
+  unsigned long cycle = 0;
+  for (int i = 0; i < PAT_LEN; i++) cycle += PAT_MS[i];  // = 1260ms
+
+  unsigned long pos = (millis() - alarmStart) % cycle;
+  unsigned long acc = 0;
+  for (int i = 0; i < PAT_LEN; i++) {
+    acc += PAT_MS[i];
+    if (pos < acc) {
+      digitalWrite(BUZZER,   PAT_ON[i] ? HIGH : LOW);
+      digitalWrite(LED_BUZZ, PAT_ON[i] ? HIGH : LOW);
+      return;
+    }
+  }
+}
+
+void checkAlarms(int h, int m, int s, int wd) {
+  if (alarmRinging) {
+    // button press stops alarm immediately
+    if (digitalRead(BTN_STOP) == LOW) {
+      stopAlarm();
+      return;
+    }
+
+    // auto-stop after duration
+    if (millis() - alarmStart > ALARM_DURATION_MS) {
+      stopAlarm();
+      return;
+    }
+
+    // buzzer + LED pattern (bz bz bz bzzzz ...)
+    updateBuzzPattern();
+
+    // flash top bar red in sync with the long buzz (PAT index 6)
+    unsigned long cycle = 0;
+    for (int i = 0; i < PAT_LEN; i++) cycle += PAT_MS[i];
+    unsigned long pos = (millis() - alarmStart) % cycle;
+    unsigned long longBuzzStart = 0;
+    for (int i = 0; i < 6; i++) longBuzzStart += PAT_MS[i];
+
+    if (pos >= longBuzzStart && pos < longBuzzStart + PAT_MS[6]) {
+      // during long buzz — show red WAKE UP bar
+      tft.fillRect(0, 0, 320, 22, C_RED);
+      tft.setTextSize(2);
+      tft.setTextColor(ILI9341_WHITE);
+      tft.setCursor(80, 5);
+      tft.print("WAKE  UP!");
+    } else if (pos < 10) {
+      // just after cycle reset — restore top bar
+      int yr2, mo2, day2;
+      decodeDate(ntpClient.getEpochTime(), yr2, mo2, day2);
+      drawTopBar(h, m, wd, day2, mo2, yr2);
+    }
+
+    return;
+  }
+
+  // button does nothing when no alarm ringing
+  if (s != 0) return;
+
+  for (int i = 0; i < MAX_ALARMS; i++) {
+    if (!alarms[i].enabled)    continue;
+    if (alarms[i].hour   != h) continue;
+    if (alarms[i].minute != m) continue;
+    if (!alarms[i].days[wd])   continue;
+    alarmRinging = true;
+    ringAlarmIdx = i;
+    alarmStart   = millis();
+    Serial.printf("ALARM %d fired!\n", i);
+    break;
+  }
+}
+
+void stopAlarm() {
+  alarmRinging = false;
+  digitalWrite(BUZZER,   LOW);
+  digitalWrite(LED_BUZZ, LOW);
+  ringAlarmIdx = -1;
+
+  drawStaticLayout();
+
+  memset(prevClockStr, ' ', sizeof(prevClockStr));
+  memset(prevSecStr,   ' ', sizeof(prevSecStr));
+  prevBarFill = -1;
+  prevBtmBar  = -1;
+  prevMinLeft = -2;
+  prevH = -1; prevM = -1; prevS = -1;
+
+  int h  = ntpClient.getHours();
+  int m  = ntpClient.getMinutes();
+  int s  = ntpClient.getSeconds();
+  int wd = ntpClient.getDay();
+  int yr, mo, day;
+  decodeDate(ntpClient.getEpochTime(), yr, mo, day);
+
+  drawTopBar(h, m, wd, day, mo, yr);
+  drawClock(h, m, s);
+  drawBottomBar(h, m, s);
+  prevIndoorTemp[0]  = ' ';
+prevIndoorHumid[0] = ' ';
+}
+// ═══════════════════════════════════════════════════════════════════
+//  SPLASH
+// ═══════════════════════════════════════════════════════════════════
+void drawSplash() {
+  tft.fillScreen(C_BG);
+  tft.drawCircle(160, 90, 40, C_ACCENT);
+  tft.drawCircle(160, 90, 41, C_DIM);
+  tft.drawLine(160, 90, 160, 60, C_CLOCKBIG);
+  tft.drawLine(160, 90, 180, 90, C_ACCENT);
+  tft.setTextColor(C_CLOCKBIG);
+  tft.setTextSize(2);
+  tft.setCursor(88, 142);
+  tft.print("ALARM  CLOCK");
+  tft.setTextColor(C_DIM);
+  tft.setTextSize(1);
+  tft.setCursor(120, 164);
+  tft.print("Connecting");
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  STATIC LAYOUT
+// ═══════════════════════════════════════════════════════════════════
+void drawStaticLayout() {
+  tft.fillRect(0,   0, 320,  22, C_TOPBAR);
+  tft.fillRect(0, 172, 320,  68, C_BTMBAR);
+  tft.fillRect(0,  22, 320, 150, C_BG);
+  tft.fillRect(30, 113, 260, 1, C_RULE);
+
+  tft.setTextSize(1);
+  tft.setTextColor(C_DIM);
+  tft.setCursor(10, 180);
+  //tft.print("NTP");
+  tft.setCursor(10, 198);
+  tft.print("NEXT ALARM");
+
+  prevClockStr[0] = ' ';
+  prevSecStr[0]   = ' ';
+  prevBarFill     = -1;
+  prevBtmBar      = -1;   // ← add this
+  prevMinLeft     = -2;
+
+  drawWeather();
+   drawIndoor();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  TOP BAR
+// ═══════════════════════════════════════════════════════════════════
+void drawTopBar(int h, int m, int wd, int day, int mo, int yr) {
+  tft.fillRect(0, 0, 320, 22, C_TOPBAR);
+  char buf[24];
+
+  tft.setTextSize(1);
+  tft.setTextColor(C_DIM);
+  tft.setCursor(10, 7);
+  tft.print(weekdayStr(wd));
+
+  tft.setTextColor(C_RULE);
+  tft.setCursor(34, 7);
+  tft.print("|");
+
+  tft.setTextColor(C_CLOCKBIG);
+  tft.setCursor(44, 7);
+  snprintf(buf, sizeof(buf), "%02d %s %04d", day, monthStr(mo), yr);
+  tft.print(buf);
+
+
+
+ 
+
+  // ── invalidate indoor cache so drawIndoor always repaints ────────
+  prevIndoorTemp[0]  = ' ';
+  prevIndoorHumid[0] = ' ';
+
+  drawIndoor();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  CLOCK — flicker-free
+// ═══════════════════════════════════════════════════════════════════
+void drawClockDigit(int x, int y, char c, uint8_t sz, uint16_t col, uint16_t bg) {
+  tft.fillRect(x, y, 6 * sz, 8 * sz, bg);
+  tft.setTextSize(sz);
+  tft.setTextColor(col);
+  tft.setCursor(x, y);
+  tft.print(c);
+}
+
+void drawClock(int h, int m, int s) {
+  char newStr[6];
+  snprintf(newStr, sizeof(newStr), "%02d:%02d", h, m);
+
+  const int charX[] = { 25, 61, 97, 133, 169 };
+  for (int i = 0; i < 5; i++) {
+    if (newStr[i] != prevClockStr[i]) {
+      drawClockDigit(charX[i], 35, newStr[i], 6, C_CLOCKBIG, C_BG);
+      prevClockStr[i] = newStr[i];
+    }
+  }
+
+  char newSec[4];
+  snprintf(newSec, sizeof(newSec), ":%02d", s);
+  const int secX[] = { 210, 222, 234 };
+  for (int i = 0; i < 3; i++) {
+    if (newSec[i] != prevSecStr[i]) {
+      drawClockDigit(secX[i], 66, newSec[i], 2, C_SEC, C_BG);
+      prevSecStr[i] = newSec[i];
+    }
+  }
+
+
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  WEATHER TILES
+// ═══════════════════════════════════════════════════════════════════
+void drawWeather() {
+  char buf[16];
+
+  tft.fillRoundRect(8, 116, 92, 52, 4, C_TILE);
+  int iconX = 22, iconY = 135;
+  if      (wDesc == "Clear")                        drawSunIcon(iconX, iconY, C_TEMP);
+  else if (wDesc=="Rain"||wDesc=="Drizzle"
+                         ||wDesc=="Showers")        drawRainIcon(iconX, iconY, C_HUMID);
+  else if (wDesc=="Snow"||wDesc=="Hail")            drawSnowIcon(iconX, iconY, ILI9341_WHITE);
+  else                                              drawCloudIcon(iconX, iconY, C_DIM);
+
+  tft.setTextSize(2); tft.setTextColor(C_TEMP);
+  tft.setCursor(36, 120);
+  snprintf(buf, sizeof(buf), "%.0f%cC", wTemp, (char)247);
+
+  tft.print(buf);
+
+  tft.setTextSize(1); tft.setTextColor(C_DIM);
+  tft.setCursor(36, 144); tft.print(wDesc);
+
+  tft.fillRoundRect(108, 116, 52, 52, 4, C_TILE);
+  tft.setTextSize(1); tft.setTextColor(C_DIM);
+  tft.setCursor(118, 120); tft.print("HUMID");
+  tft.fillTriangle(132, 134, 127, 144, 137, 144, C_HUMID);
+  tft.fillCircle(132, 144, 5, C_HUMID);
+  tft.setTextColor(C_HUMID);
+  tft.setCursor(124, 155);
+  snprintf(buf, sizeof(buf), "%d%%", wHumid); tft.print(buf);
+
+  tft.fillRoundRect(168, 116, 52, 52, 4, C_TILE);
+  tft.setTextSize(1); tft.setTextColor(C_DIM);
+  tft.setCursor(180, 120); tft.print("WIND");
+  for (int i = 0; i < 3; i++)
+    tft.drawLine(172, 134+i*6, 172+((i==1)?34:24), 134+i*6, C_WIND);
+  tft.setTextColor(C_WIND);
+  tft.setCursor(172, 153);
+  snprintf(buf, sizeof(buf), "%d km/h", wWind); tft.print(buf);
+
+  tft.fillRoundRect(228, 116, 84, 52, 4, C_TILE);
+  tft.setTextSize(1); tft.setTextColor(C_DIM);
+  tft.setCursor(246, 120); tft.print("FORECAST");
+  tft.drawFastHLine(232, 130, 76, C_RULE);
+  uint16_t fcColors[] = {C_FC0, C_FC1, C_FC2};
+  int fxPos[] = {234, 256, 278};
+  int todayWd = ntpClient.getDay();
+  for (int i = 0; i < 3; i++) {
+    int fcDay = (todayWd + 1 + i) % 7;
+    tft.setTextColor(C_DIM);
+    tft.setCursor(fxPos[i], 134); tft.print(weekdayShort(fcDay));
+    tft.setTextColor(fcColors[i]);
+    tft.setCursor(fxPos[i], 150);
+    snprintf(buf, sizeof(buf), "%.0f%c", fc[i], (char)247); tft.print(buf);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  BOTTOM BAR — fixed: no-alarm state, force redraw after save
+// ═══════════════════════════════════════════════════════════════════
+void drawBottomBar(int h, int m, int s) {
+  // ── find next upcoming alarm ──────────────────────────────────────
+  int nextH = -1, nextM = -1, minLeft = -1;
+  int wd = ntpClient.getDay();
+
+  for (int dd = 0; dd < 7 && minLeft < 0; dd++) {
+    int checkWd = (wd + dd) % 7;
+    for (int i = 0; i < MAX_ALARMS; i++) {
+      if (!alarms[i].enabled)          continue;
+      if (!alarms[i].days[checkWd])    continue;
+      int mins = dd * 1440 + alarms[i].hour * 60 + alarms[i].minute
+                 - (h * 60 + m);
+      if (mins <= 0) continue;
+      if (minLeft < 0 || mins < minLeft) {
+        minLeft = mins;
+        nextH   = alarms[i].hour;
+        nextM   = alarms[i].minute;
+      }
+    }
+    if (minLeft > 0) break;
+  }
+
+  // ── NTP dot + static labels — draw on first call only ────────────
+  bool firstDraw = (prevMinLeft == -2);
+  if (firstDraw) {
+   // tft.fillCircle(30, 182, 3, ntpSynced ? C_LIVE : C_RED);
+    //tft.setTextSize(1);
+    //tft.setTextColor(ntpSynced ? C_LIVE : C_RED);
+    //tft.setCursor(38, 178);
+   // tft.print(ntpSynced ? "SYNCED" : "NO NTP");
+  }
+
+  // ── alarm time + countdown — redraw when value changes ───────────
+  // encode state: -1 means no alarm, otherwise minutes left
+  int newMinLeft = (nextH >= 0) ? minLeft : -1;
+
+  if (newMinLeft != prevMinLeft || firstDraw) {
+    // erase alarm area completely
+    tft.fillRect(0, 196, 186, 42, C_BTMBAR);
+
+    // redraw "NEXT ALARM" label
+    tft.setTextSize(1);
+    tft.setTextColor(C_DIM);
+    tft.setCursor(10, 185);
+    tft.print("NEXT ALARM");
+
+    if (nextH >= 0) {
+      // alarm time
+      char buf[8];
+      tft.setTextSize(2);
+      tft.setTextColor(C_ACCENT);
+      tft.setCursor(10, 203);
+      snprintf(buf, sizeof(buf), "%02d:%02d", nextH, nextM);
+      tft.print(buf);
+
+      // countdown
+      tft.setTextSize(1);
+      tft.setTextColor(C_DIM);
+      tft.setCursor(76, 208);
+      char cbuf[20];
+      snprintf(cbuf, sizeof(cbuf), "in %dh %02dm", minLeft / 60, minLeft % 60);
+      tft.print(cbuf);
+    } else {
+      // no alarms enabled
+      tft.setTextSize(1);
+      tft.setTextColor(C_DIM);
+      tft.setCursor(10, 203);
+      tft.print("none active");
+    }
+
+    prevMinLeft = newMinLeft;
+  }
+
+  // ── progress bar ─────────────────────────────────────────────────
+  float progress = (h * 3600.0f + m * 60.0f + s) / 86400.0f;
+  int barFill = (int)(progress * 126.0f);
+
+  if (barFill != prevBtmBar) {
+    if (barFill > prevBtmBar && prevBtmBar >= 0) {
+      // bar grew — paint only the new strip, no rounding
+      tft.fillRect(186 + prevBtmBar, 193, barFill - prevBtmBar, 6, C_ACCENT);
+    } else {
+      // full redraw — erase with flat rect, then paint flat rect
+      tft.fillRect(186, 193, 126, 6, C_RULE);
+      if (barFill > 0) tft.fillRect(186, 193, barFill, 6, C_ACCENT);
+    }
+    prevBtmBar = barFill;
+  }
+
+  // ── day labels ───────────────────────────────────────────────────
+  static int prevTodayWd = -1;
+  int todayWd = ntpClient.getDay();
+  if (todayWd != prevTodayWd || firstDraw) {
+    tft.fillRect(180, 218, 140, 14, C_BTMBAR);
+    const char* dnames[] = {"SUN","MON","TUE","WED","THU","FRI","SAT"};
+    for (int i = 0; i < 7; i++) {
+      tft.setTextColor(i == todayWd ? C_ACCENT : C_DIM);
+      tft.setTextSize(1);
+      tft.setCursor(180 + i * 20, 220);
+      tft.print(dnames[i]);
+    }
+    tft.fillRect(180, 232, 140, 2, C_BTMBAR);
+    tft.fillRect(180 + todayWd * 20, 232, 14, 2, C_ACCENT);
+    prevTodayWd = todayWd;
+  }
+}
+void drawIndoor() {
+  char tBuf[8], hBuf[8];
+  snprintf(tBuf, sizeof(tBuf), "%.1f%c", currentTemp,  (char)247);
+  snprintf(hBuf, sizeof(hBuf), "%.0f%%", currentHum);
+
+  bool tempChanged  = (strcmp(tBuf, prevIndoorTemp)  != 0);
+  bool humidChanged = (strcmp(hBuf, prevIndoorHumid) != 0);
+
+  if (!tempChanged && !humidChanged) return;
+
+  // erase region — shifted 30px right (was x=152, now x=182)
+  tft.fillRect(182, 0, 50, 22, C_TOPBAR);
+
+  // ── temperature — top line ──
+  tft.fillCircle(185, 7, 2, tft.color565(255, 100, 60));
+  tft.drawLine(185, 3, 185, 9, tft.color565(255, 100, 60));
+
+  tft.setTextSize(1);
+  tft.setTextColor(tft.color565(255, 130, 80));
+  tft.setCursor(190, 3);
+  tft.print(tBuf);
+
+  // ── humidity — bottom line ──
+  tft.fillCircle(185, 16, 2, tft.color565(60, 160, 255));
+
+  tft.setTextSize(1);
+  tft.setTextColor(tft.color565(80, 180, 255));
+  tft.setCursor(190, 13);
+  tft.print(hBuf);
+
+  strncpy(prevIndoorTemp,  tBuf, sizeof(prevIndoorTemp));
+  strncpy(prevIndoorHumid, hBuf, sizeof(prevIndoorHumid));
+}
+// ═══════════════════════════════════════════════════════════════════
+//  WEATHER FETCH
+// ═══════════════════════════════════════════════════════════════════
+void fetchWeather() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  Serial.println("WEATHER: fetching...");
+  HTTPClient http;
+  http.setTimeout(10000);
+  String url =
+    "http://api.open-meteo.com/v1/forecast"
+    "?latitude="  + String(weatherLat) +
+    "&longitude=" + String(weatherLon) +
+    "&current=temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code"
+    "&daily=temperature_2m_max"
+    "&timezone=auto"
+    "&forecast_days=4";
+
+  http.begin(url);
+  int code = http.GET();
+  Serial.print("WEATHER: HTTP code = "); Serial.println(code);
+
+  if (code == 200) {
+    String payload = http.getString();
+    DynamicJsonDocument doc(8192);
+    DeserializationError err = deserializeJson(doc, payload);
+    if (err) {
+      Serial.print("WEATHER: JSON error: "); Serial.println(err.c_str());
+      http.end();
+      lastWeatherMs = millis() - WEATHER_INTERVAL_MS + 30000UL;
+      return;
+    }
+
+    wTemp  = doc["current"]["temperature_2m"].as<float>();
+    wHumid = doc["current"]["relative_humidity_2m"].as<int>();
+    wWind  = doc["current"]["wind_speed_10m"].as<int>();
+    int wc = doc["current"]["weather_code"].as<int>();
+
+    for (int i = 0; i < 3; i++)
+      fc[i] = doc["daily"]["temperature_2m_max"][i + 1].as<float>();
+
+    if      (wc == 0)  wDesc = "Clear";
+    else if (wc <= 2)  wDesc = "Cloudy";
+    else if (wc == 3)  wDesc = "Overcast";
+    else if (wc <= 49) wDesc = "Foggy";
+    else if (wc <= 59) wDesc = "Drizzle";
+    else if (wc <= 69) wDesc = "Rain";
+    else if (wc <= 79) wDesc = "Snow";
+    else if (wc <= 84) wDesc = "Showers";
+    else if (wc <= 94) wDesc = "Hail";
+    else               wDesc = "Storm";
+
+    Serial.printf("WEATHER: %.1f C  %d%%  %d km/h  wc=%d  %s\n",
+                  wTemp, wHumid, wWind, wc, wDesc.c_str());
+    lastWeatherMs = millis();
+    drawWeather();
+  } else {
+    lastWeatherMs = millis() - WEATHER_INTERVAL_MS + 30000UL;
+    Serial.println("WEATHER: fetch failed, retry in 30s");
+  }
+  http.end();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  WEATHER ICONS
+// ═══════════════════════════════════════════════════════════════════
+void drawSunIcon(int cx, int cy, uint16_t col) {
+  tft.fillCircle(cx, cy, 5, col);
+  for (int a = 0; a < 360; a += 45) {
+    float r = a * PI / 180.0f;
+    tft.drawLine(cx+cos(r)*7, cy+sin(r)*7, cx+cos(r)*10, cy+sin(r)*10, col);
+  }
+}
+void drawCloudIcon(int cx, int cy, uint16_t col) {
+  tft.fillCircle(cx-4, cy,   5, col);
+  tft.fillCircle(cx+3, cy-2, 6, col);
+  tft.fillCircle(cx+8, cy,   4, col);
+  tft.fillRect(cx-4, cy, 14, 5, col);
+}
+void drawRainIcon(int cx, int cy, uint16_t col) {
+  drawCloudIcon(cx, cy-4, col);
+  for (int i = 0; i < 3; i++)
+    tft.drawLine(cx-2+i*5, cy+5, cx-4+i*5, cy+10, col);
+}
+void drawSnowIcon(int cx, int cy, uint16_t col) {
+  tft.drawLine(cx-7, cy, cx+7, cy, col);
+  tft.drawLine(cx, cy-7, cx, cy+7, col);
+  tft.drawLine(cx-5, cy-5, cx+5, cy+5, col);
+  tft.drawLine(cx+5, cy-5, cx-5, cy+5, col);
+  tft.fillCircle(cx, cy, 2, col);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  DATE DECODER
+// ═══════════════════════════════════════════════════════════════════
+void decodeDate(unsigned long epoch, int &yr, int &mo, int &day) {
+  uint32_t rem = epoch / 86400UL;
+  yr = 1970;
+  while (true) {
+    bool leap = (yr%4==0 && (yr%100!=0 || yr%400==0));
+    uint32_t dy = leap ? 366 : 365;
+    if (rem < dy) break;
+    rem -= dy; yr++;
+  }
+  bool leap = (yr%4==0 && (yr%100!=0 || yr%400==0));
+  static const uint8_t dpm[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+  mo = 1;
+  while (true) {
+    uint8_t dim = dpm[mo-1] + (mo==2 && leap ? 1 : 0);
+    if (rem < dim) break;
+    rem -= dim; mo++;
+  }
+  day = rem + 1;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  STRING HELPERS
+// ═══════════════════════════════════════════════════════════════════
+const char* weekdayStr(int wd) {
+  const char* d[] = {"SUN","MON","TUE","WED","THU","FRI","SAT"};
+  return (wd>=0&&wd<7) ? d[wd] : "---";
+}
+const char* weekdayShort(int wd) {
+  const char* d[] = {"SUN","MON","TUE","WED","THU","FRI","SAT"};
+  return (wd>=0&&wd<7) ? d[wd] : "---";
+}
+const char* monthStr(int mo) {
+  const char* m[] = {"","JAN","FEB","MAR","APR","MAY","JUN",
+                        "JUL","AUG","SEP","OCT","NOV","DEC"};
+  return (mo>=1&&mo<=12) ? m[mo] : "---";
+}
